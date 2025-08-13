@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+Tech Checker – quick swing-trade checklist for any stock.
+
+Usage examples:
+  python tech_checker.py --symbol HEROMOTOCO.NS
+  python tech_checker.py --symbol DALBHARAT.NS --interval 1d --lookback 300 --capital 100000 --risk_pct 1.0
+  python tech_checker.py --symbol MAHSEAMLES.NS --interval 1d --export report.json
+
+Notes
+- For NSE tickers on Yahoo! Finance, append ".NS" (e.g., TATAMOTORS.NS, HEROMOTOCO.NS).
+- This is not financial advice; use at your own risk.
+"""
+
+import argparse, json, sys, math
+from datetime import datetime, timedelta
+
+try:
+    import yfinance as yf
+    import numpy as np
+    import pandas as pd
+except ImportError:
+    print("Please install dependencies: pip install yfinance pandas numpy", file=sys.stderr)
+    sys.exit(1)
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain, index=series.index).rolling(length).mean()
+    roll_down = pd.Series(loss, index=series.index).rolling(length).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.DataFrame({
+        "h-l": (h - l),
+        "h-pc": (h - c.shift(1)).abs(),
+        "l-pc": (l - c.shift(1)).abs()
+    }).max(axis=1)
+    return tr.rolling(length).mean()
+
+def load_history(symbol: str, interval: str, lookback: int) -> pd.DataFrame:
+    # yfinance needs enough bars to compute 200-SMA, etc.
+    period_days = max(lookback + 50, 260)
+    period = f"{period_days}d"
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        raise ValueError(f"No data for {symbol}. Check the ticker (NSE needs .NS).")
+    return df
+
+def analyze(df: pd.DataFrame):
+    out = {}
+    df = df.copy()
+
+    df["EMA9"] = ema(df["Close"], 9)
+    df["EMA21"] = ema(df["Close"], 21)
+    df["EMA50"] = ema(df["Close"], 50)
+    df["SMA200"] = sma(df["Close"], 200)
+    df["RSI14"] = rsi(df["Close"], 14)
+    df["Vol20"] = sma(df["Volume"], 20)
+    df["ATR14"] = atr(df, 14)
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Checklist rules
+    rules = []
+
+    # 1) Long-term trend
+    rules.append({
+        "name": "Uptrend (Close > SMA200)",
+        "pass": bool(last.Close > last.SMA200),
+        "value": f"{last.Close:.2f} vs {last.SMA200:.2f}"
+    })
+
+    # 2) EMA alignment for momentum
+    rules.append({
+        "name": "Momentum (EMA9 > EMA21 > EMA50)",
+        "pass": bool(last.EMA9 > last.EMA21 > last.EMA50),
+        "value": f"{last.EMA9:.2f} > {last.EMA21:.2f} > {last.EMA50:.2f}"
+    })
+
+    # 3) Pullback-friendly RSI zone
+    rules.append({
+        "name": "RSI sweet spot (50–65)",
+        "pass": bool(50 <= last.RSI14 <= 65),
+        "value": f"{last.RSI14:.2f}"
+    })
+
+    # 4) Volume confirmation: today > 20-day avg
+    rules.append({
+        "name": "Volume > 20-day avg",
+        "pass": bool(last.Volume > last.Vol20),
+        "value": f"{int(last.Volume)} vs {int(last.Vol20)}"
+    })
+
+    # 5) Breakout vs. Pullback context
+    lookback_high = df["Close"].rolling(20).max().iloc[-2]  # yesterday’s 20D high
+    breakout = last.Close > lookback_high and last.Close > last.EMA9
+    pullback_to_21 = (last.Low <= last.EMA21 <= last.High) or (abs(last.Close - last.EMA21)/last.EMA21 <= 0.01)
+    rules.append({
+        "name": "Context (Breakout or Pullback-to-21EMA)",
+        "pass": bool(breakout or pullback_to_21),
+        "value": f"breakout={breakout}, pullback_to_21={pullback_to_21}"
+    })
+
+    # 6) No immediate overhead supply (Close within 1% of 20D high? then breakout OK)
+    twenty_high = df["High"].rolling(20).max().iloc[-1]
+    near_high = last.Close >= 0.99 * twenty_high
+    rules.append({
+        "name": "Near 20D high (breakout quality)",
+        "pass": bool(near_high or pullback_to_21),
+        "value": f"close={last.Close:.2f}, 20D_high={twenty_high:.2f}"
+    })
+
+    score = sum(1 for r in rules if r["pass"])
+    out["score"] = score
+    out["rules"] = rules
+
+    # Signal & levels
+    signal = "WATCH"
+    if score >= 5:
+        signal = "BUY (aggressive)"
+    elif score == 4:
+        signal = "BUY on dips"
+    elif score <= 2:
+        signal = "AVOID / WAIT"
+
+    # Risk controls (ATR-based)
+    risk_atr_mult = 1.5
+    sl = round(float(last.Close - risk_atr_mult * last.ATR14), 2)
+    first_target = round(float(last.Close + risk_atr_mult * last.ATR14 * 1.5), 2)
+    out.update({
+        "close": round(float(last.Close), 2),
+        "rsi": round(float(last.RSI14), 2),
+        "ema9": round(float(last.EMA9), 2),
+        "ema21": round(float(last.EMA21), 2),
+        "ema50": round(float(last.EMA50), 2),
+        "sma200": round(float(last.SMA200), 2),
+        "atr14": round(float(last.ATR14), 2),
+        "breakout_20d": bool(breakout),
+        "pullback_to_21ema": bool(pullback_to_21),
+        "signal": signal,
+        "suggested_sl": sl,
+        "first_target": first_target
+    })
+    return out
+
+def suggest_position(capital: float, risk_pct: float, entry: float, stop: float):
+    if capital <= 0 or risk_pct <= 0 or entry <= stop:
+        return {"qty": 0, "risk_per_trade": 0.0, "per_share_risk": 0.0}
+    risk_amount = capital * (risk_pct / 100.0)
+    per_share = entry - stop
+    qty = math.floor(risk_amount / per_share) if per_share > 0 else 0
+    return {
+        "qty": int(max(qty, 0)),
+        "risk_per_trade": round(risk_amount, 2),
+        "per_share_risk": round(per_share, 2)
+    }
+
+def main():
+    p = argparse.ArgumentParser(description="Technical checklist for swing entries.")
+    p.add_argument("--symbol", required=True, help="Ticker (e.g., HEROMOTOCO.NS)")
+    p.add_argument("--interval", default="1d", help="yfinance interval (1d, 1h, 1wk)")
+    p.add_argument("--lookback", type=int, default=220, help="Bars to analyze (>=200 recommended)")
+    p.add_argument("--capital", type=float, default=0.0, help="Account capital for position sizing")
+    p.add_argument("--risk_pct", type=float, default=1.0, help="Risk %% per trade (default 1%)")
+    p.add_argument("--export", default="", help="Optional path to save JSON report")
+    args = p.parse_args()
+
+    df = load_history(args.symbol, args.interval, args.lookback)
+    res = analyze(df)
+
+    pos = suggest_position(args.capital, args.risk_pct, res["close"], res["suggested_sl"])
+    res["position_sizing"] = pos
+    res["generated_at"] = datetime.utcnow().isoformat() + "Z"
+    res["interval"] = args.interval
+    res["symbol"] = args.symbol
+
+    # Pretty print
+    print("=" * 64)
+    print(f"{args.symbol}  |  Interval: {args.interval}")
+    print("-" * 64)
+    print(f"Signal: {res['signal']}  |  Score: {res['score']}/6")
+    print(f"Close: {res['close']}  |  RSI14: {res['rsi']}  |  ATR14: {res['atr14']}")
+    print(f"EMA9/21/50: {res['ema9']}/{res['ema21']}/{res['ema50']}  |  SMA200: {res['sma200']}")
+    print(f"Breakout20D: {res['breakout_20d']}  |  Pullback-to-21EMA: {res['pullback_to_21ema']}")
+    print(f"Suggested SL: {res['suggested_sl']}  |  First Target: {res['first_target']}")
+    if args.capital > 0:
+        print(f"Pos. sizing → Qty: {pos['qty']}  |  Risk/trade: ₹{pos['risk_per_trade']}  |  Risk/share: ₹{pos['per_share_risk']}")
+    print("-" * 64)
+    print("Checklist:")
+    for r in res["rules"]:
+        mark = "✅" if r["pass"] else "❌"
+        print(f" {mark} {r['name']}  ({r['value']})")
+    print("=" * 64)
+
+    if args.export:
+        with open(args.export, "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+        print(f"Saved report → {args.export}")
+
+if __name__ == "__main__":
+    main()
